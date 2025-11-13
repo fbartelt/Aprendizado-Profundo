@@ -10,6 +10,7 @@ import torchvision
 from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 
+
 # --------------------------
 # 1. Simple sinusoidal time embedding
 # --------------------------
@@ -139,12 +140,15 @@ class TinyUNet(nn.Module):
 
         return self.final_conv(u2)  # predicts noise ε(x_t,t)
 
+
 # ---------------------------
 # Utilities: beta schedule, sampling q(x_t | x_0, eps), saving images
 # ---------------------------
 
+
 def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02):
     return torch.linspace(beta_start, beta_end, timesteps)
+
 
 def q_sample(x0, t, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noise=None):
     """
@@ -157,9 +161,10 @@ def q_sample(x0, t, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noise=No
     if noise is None:
         noise = torch.randn_like(x0)
     # gather the scalars for each sample in the batch
-    sa = sqrt_alphas_cumprod[t].view(-1,1,1,1)
-    sb = sqrt_one_minus_alphas_cumprod[t].view(-1,1,1,1)
+    sa = sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+    sb = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
     return sa * x0 + sb * noise, noise
+
 
 def save_image_grid(x, path, nrow=8):
     # x in [-1,1] -> [0,1] for saving
@@ -168,38 +173,56 @@ def save_image_grid(x, path, nrow=8):
     grid = make_grid(x, nrow=nrow, padding=2)
     save_image(grid, path)
 
+
 # ---------------------------
 # Training function
 # ---------------------------
 
+
 def train_ddpm(
-    out_dir = "./ddpm_cifar",
-    epochs = 20,
-    batch_size = 128,
-    lr = 2e-4,
-    timesteps = 200,
-    device = None,
-    save_every = 5,
-    img_size = 32
+    out_dir="./ddpm_celeba",
+    epochs=20,
+    batch_size=128,
+    lr=2e-4,
+    timesteps=200,
+    device=None,
+    save_every=5,
+    img_size=32,
 ):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(out_dir, exist_ok=True)
 
     # dataset + dataloader
-    transform = transforms.Compose([
-        transforms.Resize(img_size),
-        transforms.ToTensor(),              # [0,1]
-        transforms.Lambda(lambda t: (t * 2.0) - 1.0)  # to [-1,1]
-    ])
-    train_ds = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-    dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    # transform = transforms.Compose([
+    #     transforms.Resize(img_size),
+    #     transforms.ToTensor(),              # [0,1]
+    #     transforms.Lambda(lambda t: (t * 2.0) - 1.0)  # to [-1,1]
+    # ])
+    # train_ds = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    transform = transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            # transforms.Normalize(mean=[0.5, 0.5, 0.5],
+            #                      std=[0.5, 0.5, 0.5])
+        ]
+    )
+
+    train_ds = torchvision.datasets.CelebA(
+        root="./data", split="train", download=False, transform=transform
+    )
+
+    dl = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
+    )
 
     # model
     model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(device)
 
     # timesteps schedule
-    betas = linear_beta_schedule(timesteps=timesteps).to(device)                # beta_t
+    betas = linear_beta_schedule(timesteps=timesteps).to(device)  # beta_t
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
@@ -222,7 +245,9 @@ def train_ddpm(
 
             # sample noise and x_t
             eps = torch.randn_like(xb)
-            x_t, used_noise = q_sample(xb, t, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noise=eps)
+            x_t, used_noise = q_sample(
+                xb, t, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noise=eps
+            )
 
             # predict eps_theta(x_t, t)
             pred = model(x_t, t)
@@ -236,16 +261,16 @@ def train_ddpm(
             opt.step()
 
             global_step += 1
-            pbar.set_postfix({'loss': loss.item(), 'step': global_step})
+            pbar.set_postfix({"loss": loss.item(), "step": global_step})
 
         # save checkpoint and sample images every save_every epochs
         if (epoch + 1) % save_every == 0 or (epoch + 1) == epochs:
             ckpt = {
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': opt.state_dict(),
-                'epoch': epoch,
-                'timesteps': timesteps,
-                'betas': betas.cpu()
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "epoch": epoch,
+                "timesteps": timesteps,
+                "betas": betas.cpu(),
             }
             torch.save(ckpt, os.path.join(out_dir, f"ckpt_epoch_{epoch+1}.pt"))
             print(f"Saved checkpoint to {out_dir}/ckpt_epoch_{epoch+1}.pt")
@@ -263,23 +288,33 @@ def train_ddpm(
                     sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
                     sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
                     # estimate x0_pred
-                    x0_pred = (x - sqrt_one_minus_alpha_bar_t * eps_pred) / sqrt_alpha_bar_t
+                    x0_pred = (
+                        x - sqrt_one_minus_alpha_bar_t * eps_pred
+                    ) / sqrt_alpha_bar_t
                     # simple deterministic reverse (similar to DDIM with eta=0)
                     if ti > 0:
-                        alpha_bar_prev = alphas_cumprod[ti-1].to(device)
+                        alpha_bar_prev = alphas_cumprod[ti - 1].to(device)
                         sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
                         sqrt_one_minus_alpha_bar_prev = torch.sqrt(1.0 - alpha_bar_prev)
                     else:
                         sqrt_alpha_bar_prev = torch.tensor(1.0, device=device)
                         sqrt_one_minus_alpha_bar_prev = torch.tensor(0.0, device=device)
-                    x = sqrt_alpha_bar_prev * x0_pred + sqrt_one_minus_alpha_bar_prev * eps_pred
+                    x = (
+                        sqrt_alpha_bar_prev * x0_pred
+                        + sqrt_one_minus_alpha_bar_prev * eps_pred
+                    )
 
                 # save samples grid
-                save_image_grid(x.cpu(), os.path.join(out_dir, f"samples_epoch_{epoch+1}.png"), nrow=8)
+                save_image_grid(
+                    x.cpu(),
+                    os.path.join(out_dir, f"samples_epoch_{epoch+1}.png"),
+                    nrow=8,
+                )
                 print(f"Saved sample grid to {out_dir}/samples_epoch_{epoch+1}.png")
 
     print("Training finished.")
     return model, alphas_cumprod.cpu()
+
 
 ## CLIP RELATED DDIM
 CLIP_IMAGE_SIZE = 224
@@ -289,11 +324,12 @@ CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711])
 
 def prepare_image_for_clip(x: torch.Tensor):
     """
-    x: (B,3,H,W) in range [-1,1]
+    x: (B,3,H,W) in range [0, 1] or [-1,1]
     returns: (B,3,224,224) normalized tensor suitable for clip.encode_image
     """
     # to [0,1]
-    x = (x + 1.0) / 2.0
+    if x.min() < 0.0:
+        x = (x + 1.0) / 2.0
     x = x.clamp(0.0, 1.0)
 
     # resize to CLIP size using bilinear
@@ -373,7 +409,7 @@ class DDIMSampler:
     def invert_image(self, x0, verbose=False):
         """
         Deterministically map an image x0 -> x_T (DDIM inversion).
-        x0: (B,C,H,W) in [-1,1]
+        x0: (B,C,H,W) in [0, 1]
         Returns: x_T (same shape)
         Simplified approach: iterate forward steps t=0..T-1 using model predictions.
         """
@@ -401,7 +437,101 @@ class DDIMSampler:
         return x
 
     # ---------- CLIP-guided editing ----------
+
     def edit_with_clip(
+        self,
+        x0,
+        clip_model,
+        clip_preprocess,
+        img_desc,          # description of the input image (label → text)
+        text_prompt,       # target edit description
+        guidance_scale=100.0,
+        guidance_lr=0.01,
+        guidance_steps=1,
+        edit_steps_per_t=1,
+        verbose=False,
+    ):
+        """
+        x0: (B,3,H,W) in [0,1]
+        clip_model: pretrained CLIP model
+        img_desc: string or list describing the input image (source domain)
+        text_prompt: string or list describing the target edit (target domain)
+        """
+
+        device = x0.device
+        batch_size = x0.shape[0]
+
+        # --- Encode source and target texts ---
+        if isinstance(text_prompt, str):
+            text_prompt = [text_prompt] * batch_size
+        if isinstance(img_desc, str):
+            img_desc = [img_desc] * batch_size
+
+        text_tokens_tgt = clip.tokenize(text_prompt).to(device)
+        text_tokens_src = clip.tokenize(img_desc).to(device)
+
+        with torch.no_grad():
+            text_emb_tgt = clip_model.encode_text(text_tokens_tgt)
+            text_emb_src = clip_model.encode_text(text_tokens_src)
+            text_emb_tgt = text_emb_tgt / text_emb_tgt.norm(dim=-1, keepdim=True)
+            text_emb_src = text_emb_src / text_emb_src.norm(dim=-1, keepdim=True)
+            text_dir = text_emb_tgt - text_emb_src
+            text_dir = text_dir / text_dir.norm(dim=-1, keepdim=True)
+
+        # --- Invert image to noise space ---
+        with torch.no_grad():
+            x_t = self.invert_image(x0, verbose=verbose)
+
+        # --- Start reverse diffusion with guidance ---
+        for t in reversed(range(self.T)):
+            with torch.no_grad():
+                x_prev = self.ddim_step(x_t, t)
+
+            x_guided = x_prev.clone().detach().requires_grad_(True)
+
+            for gs in range(guidance_steps):
+                img_for_clip = prepare_image_for_clip(x_guided)
+                img_emb_tgt = clip_model.encode_image(img_for_clip)
+                img_emb_tgt = img_emb_tgt / img_emb_tgt.norm(dim=-1, keepdim=True)
+
+                with torch.no_grad():
+                    img_emb_src = clip_model.encode_image(prepare_image_for_clip(x0))
+                    img_emb_src = img_emb_src / img_emb_src.norm(dim=-1, keepdim=True)
+
+                # --- Directional CLIP loss (Eq. 9 in paper) ---
+                img_dir = img_emb_tgt - img_emb_src
+                img_dir = img_dir / img_dir.norm(dim=-1, keepdim=True)
+
+                dir_loss = 1 - (img_dir * text_dir).sum(dim=-1).mean()
+
+                lambda_1 = 0.3  # weight for identity loss (Eq. 11)
+                # Should have a L_face as well, but omitted for simplicity
+                id_loss = lambda_1 * (x0 - x_guided).norm1(dim=-1).mean()
+                
+                total_loss = dir_loss + id_loss
+
+                total_loss.backward()
+                # dir_loss.backward()
+
+                grad = x_guided.grad
+                with torch.no_grad():
+                    x_guided = x_guided - guidance_lr * grad * guidance_scale
+                    x_guided = x_guided.clamp(-1.5, 1.5).detach().requires_grad_(True)
+
+                if verbose:
+                    print(f"t={t}, step={gs+1}/{guidance_steps}, dir_loss={dir_loss.item():.4f}")
+
+            x_t = x_guided.detach()
+            del x_prev, img_for_clip, img_emb_tgt, img_emb_src, dir_loss
+            torch.cuda.empty_cache()
+
+            if verbose and (t % 10 == 0):
+                print(f"edited step t={t}")
+
+        return x_t.detach()
+
+
+    def edit_with_clip_old(
         self,
         x0,
         clip_model,
@@ -414,7 +544,7 @@ class DDIMSampler:
         verbose=False,
     ):
         """
-        x0: (B,3,H,W) in [-1,1]  -- input images to edit (seen->seen case)
+        x0: (B,3,H,W) in [0, 1]  -- input images to edit (seen->seen case)
         clip_model: pretrained CLIP model (from clip.load)
         clip_preprocess: not strictly needed if using tensor pipeline; kept for API compatibility
         text_prompt: string or list of strings (one per batch entry)
@@ -437,12 +567,15 @@ class DDIMSampler:
             text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
         # 1) invert image to x_T
-        x_t = self.invert_image(x0, verbose=verbose)  # x_T
+        with torch.no_grad():
+            x_t = self.invert_image(x0, verbose=verbose)  # x_T
 
         # 2) run reverse DDIM steps t = T-1 ... 0
         for t in reversed(range(self.T)):
             # one deterministic step
-            x_prev = self.ddim_step(x_t, t)
+            # x_prev = self.ddim_step(x_t, t)
+            with torch.no_grad():
+                x_prev = self.ddim_step(x_t, t)
 
             # CLIP guidance: n small gradient steps that nudge x_prev to increase similarity(text,image)
             # We'll update x_prev in-place using gradient ascent (maximize cosine similarity).
@@ -450,7 +583,7 @@ class DDIMSampler:
             x_guided = x_prev.clone().detach().requires_grad_(True)
 
             for gs in range(guidance_steps):
-                # Prepare image for CLIP: convert [-1,1] -> normalized clip input
+                # Prepare image for CLIP: convert [0,1] -> normalized clip input
                 img_for_clip = prepare_image_for_clip(x_guided)  # (B,3,224,224)
                 # encode image
                 image_emb = clip_model.encode_image(img_for_clip)
@@ -461,6 +594,9 @@ class DDIMSampler:
 
                 # we want to maximize cos_sim => minimize negative similarity
                 clip_loss = -cos_sim.mean()
+                print(
+                    f"t={t}, guidance step {gs+1}/{guidance_steps}, clip_loss={clip_loss.item():.4f}"
+                )
 
                 # backward to get gradient w.r.t. x_guided
                 clip_loss.backward()
@@ -477,6 +613,10 @@ class DDIMSampler:
             # after guidance steps, set x_t for next iteration
             x_t = x_guided.detach()
 
+            # optionally clear memory
+            del x_prev, img_for_clip, image_emb, cos_sim, clip_loss, grad
+            torch.cuda.empty_cache()
+
             if verbose and (t % 10 == 0):
                 print(f"edited step t={t}")
 
@@ -485,47 +625,221 @@ class DDIMSampler:
         return edited
 
 
-# %%
-if __name__ == "__main__":
-    model, alphas_cumprod = train_ddpm(out_dir="./", epochs=10, batch_size=128, lr=2e-4, timesteps=200)
-
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def edit_image_with_clip(
+    img, model_path="./models/celeba/ckpt_epoch_10.pt", prompt_style="sketch"
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Load a pretrained model
+    ckpt_path = model_path
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    betas = ckpt["betas"].to(device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
     sampler = DDIMSampler(model.to(device), alphas_cumprod.to(device))
 
     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device, jit=False)
 
-    img_size = 32
-    transform = transforms.Compose([
-            transforms.Resize(img_size),
-            transforms.ToTensor(),              # [0,1]
-            transforms.Lambda(lambda t: (t * 2.0) - 1.0)  # to [-1,1]
-        ])
-    train_ds = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    transform = transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+        ]
+    )
+
     x0 = train_ds[0][0].unsqueeze(0).to(device)
 
+    edited = sampler.edit_with_clip(
+        x0.to(device),
+        clip_model,
+        clip_preprocess,
+        prompt_sytle,
+        guidance_scale=100.0,
+        guidance_lr=0.01,
+        guidance_steps=1,
+        verbose=True,
+    )
+    return edited
 
-    edited = sampler.edit_with_clip(x0.to(device), clip_model, clip_preprocess, "sketch",
-                                   guidance_scale=100.0, guidance_lr=0.01, guidance_steps=1, verbose=True)
+
+# %%
+if __name__ == "__main__":
+    image_size = 128
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
+    # Load a pretrained model
+    ckpt_path = "./models/celeba/ckpt_epoch_10.pt"
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    timesteps = ckpt["timesteps"]
+    betas = ckpt["betas"].to(device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    # model, alphas_cumprod = train_ddpm(
+    #     out_dir="./models/celeba",
+    #     epochs=10,
+    #     batch_size=30,
+    #     lr=2e-4,
+    #     timesteps=200,
+    #     img_size=image_size,
+    #     device=device,
+    # )
+
+    sampler = DDIMSampler(model.to(device), alphas_cumprod.to(device))
+
+    clip_model, clip_preprocess = clip.load("ViT-B/32", device=device, jit=False)
+
+    transform = transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            # transforms.Normalize(mean=[0.5, 0.5, 0.5],
+            #                      std=[0.5, 0.5, 0.5])
+        ]
+    )
+
+    train_ds = torchvision.datasets.CelebA(
+        root="./data",
+        split="train",
+        target_type="attr",
+        download=False,
+        transform=transform,
+    )
+
+    # transform = transforms.Compose([
+    #         transforms.Resize(img_size),
+    #         transforms.ToTensor(),              # [0,1]
+    #         transforms.Lambda(lambda t: (t * 2.0) - 1.0)  # to [-1,1]
+    #     ])
+    # train_ds = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    x0 = train_ds[0][0].unsqueeze(0).to(device)
+    img, label = train_ds[0]
+    
+
+    img_desc = "face"
+    prompt_sytle = "beard"
+    edited = sampler.edit_with_clip(
+        x0.to(device),
+        clip_model,
+        clip_preprocess,
+        img_desc,
+        prompt_sytle,
+        guidance_scale=100.0,
+        guidance_lr=0.01,
+        guidance_steps=10,
+        verbose=True,
+    )
 
 # %%
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
 
-# Convert tensors from [-1, 1] to [0, 1] for display
-x0 = train_ds[40][0].unsqueeze(0).to(device)
-original_image_display = (x0.squeeze(0).cpu() + 1) / 2
-edited_image_display = (edited.squeeze(0).cpu() + 1) / 2
+
+# Images are in [0, 1]
+# x0 = train_ds[5][0].unsqueeze(0).to(device)
+original_image_display = x0.squeeze(0).cpu()
+edited_image_display = edited.squeeze(0).cpu()
+# original_image_display = (x0.squeeze(0).cpu() + 1) / 2
+# edited_image_display = (edited.squeeze(0).cpu() + 1) / 2
+
+
+def _create_fig():
+    fig = make_subplots(1, 2)
+    fig.add_trace(
+        go.Image(z=original_image_display.permute(1, 2, 0).numpy() * 255), row=1, col=1
+    )
+    fig.add_trace(
+        go.Image(z=edited_image_display.permute(1, 2, 0).numpy() * 255), row=1, col=2
+    )
+    return fig
+
+
+fig = _create_fig()
+fig.show()
 
 plt.figure(figsize=(10, 5))
-
 plt.subplot(1, 2, 1)
 plt.imshow(original_image_display.permute(1, 2, 0))
-plt.title('Original Image')
-plt.axis('off')
-
+plt.title("Original Image")
+plt.axis("off")
 plt.subplot(1, 2, 2)
 plt.imshow(edited_image_display.permute(1, 2, 0))
-plt.title('Edited Image (Van Gogh style)')
-plt.axis('off')
-
+plt.title(f"Edited Image ({prompt_sytle})")
+plt.axis("off")
 plt.show()
+plt.savefig("clip_guided_editing_result.png")
+
+# %%
+import torchvision
+from torchvision.datasets import CelebA
+from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader
+from torchvision import transforms
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.express as px
+
+# Root directory for the dataset
+data_root = "data/celeba"
+# Spatial size of training images, images are resized to this size.
+image_size = 128
+# batch size
+batch_size = 10
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+transform = transforms.Compose(
+    [
+        transforms.Resize(image_size),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        # transforms.Normalize(mean=[0.5, 0.5, 0.5],
+        #                      std=[0.5, 0.5, 0.5])
+    ]
+)
+
+train_ds = torchvision.datasets.CelebA(
+    root="./data", split="train", download=False, transform=transform
+)
+
+
+# Convert tensors from [-1, 1] to [0, 1] for display
+x0 = train_ds[2][0].unsqueeze(0).to(device)
+original_image_display = (x0.squeeze(0).cpu() + 1) / 2
+original_image_display = x0.squeeze(0).cpu()
+# edited_image_display = (edited.squeeze(0).cpu() + 1) / 2
+
+px.imshow(original_image_display.permute(1, 2, 0).numpy())
+
+
+
+# %% 
+
+# Before loop:
+src_tokens = clip.tokenize(["photo"] * batch_size).to(device)
+with torch.no_grad():
+    src_emb = clip_model.encode_text(src_tokens)
+    src_emb = src_emb / src_emb.norm(dim=-1, keepdim=True)
+
+# Inside guidance step:
+image_emb = clip_model.encode_image(img_for_clip)
+image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
+
+# Directional CLIP loss (DiffusionCLIP)
+delta_i = image_emb - orig_image_emb.detach()
+delta_t = text_emb - src_emb
+delta_i = delta_i / delta_i.norm(dim=-1, keepdim=True)
+delta_t = delta_t / delta_t.norm(dim=-1, keepdim=True)
+clip_loss = 1 - (delta_i * delta_t).sum(dim=-1).mean()
+
+
+
+# Optionally
+clip_loss = 0.5 * (1 - (delta_i * delta_t).sum(dim=-1).mean()) \
+          + 0.5 * (1 - (image_emb * text_emb).sum(dim=-1).mean())
