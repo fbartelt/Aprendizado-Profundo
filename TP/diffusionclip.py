@@ -1,4 +1,6 @@
 import os
+import glob
+import re
 import math
 import clip
 from tqdm import tqdm
@@ -9,6 +11,8 @@ from torch.utils.data import DataLoader
 import torchvision
 from torchvision import transforms
 from torchvision.utils import make_grid, save_image
+import plotly.express as px
+import plotly.graph_objects as go
 
 
 # --------------------------
@@ -406,7 +410,7 @@ class DDIMSampler:
         return x_t  # x_0 predictions
 
     # ---------- DDIM inversion (seen -> seen) ----------
-    def invert_image(self, x0, verbose=False):
+    def invert_image(self, x0, return_step=None, verbose=False):
         """
         Deterministically map an image x0 -> x_T (DDIM inversion).
         x0: (B,C,H,W) in [0, 1]
@@ -415,8 +419,11 @@ class DDIMSampler:
         """
         device = x0.device
         x = x0.clone().to(device)
+        final_step = (
+            (self.T - 1) if return_step is None else min(return_step, self.T - 1)
+        )
         # Note: this is a simple deterministic forward pass for inversion.
-        for t in range(0, self.T - 1):  # produce x_{t+1} up to x_T-1 -> final x_T
+        for t in range(0, final_step):  # produce x_{t+1} up to x_T-1 -> final x_T
             # predict eps at current x (model expects the corresponding timestep)
             t_tensor = torch.full((x.shape[0],), t, dtype=torch.long, device=device)
             eps_pred = self.model(x, t_tensor)
@@ -443,13 +450,14 @@ class DDIMSampler:
         x0,
         clip_model,
         clip_preprocess,
-        img_desc,          # description of the input image (label → text)
-        text_prompt,       # target edit description
+        img_desc,  # description of the input image (label → text)
+        text_prompt,  # target edit description
         guidance_scale=100.0,
         guidance_lr=0.01,
         guidance_steps=1,
         edit_steps_per_t=1,
         verbose=False,
+        x0islatent=False,
     ):
         """
         x0: (B,3,H,W) in [0,1]
@@ -479,8 +487,11 @@ class DDIMSampler:
             text_dir = text_dir / text_dir.norm(dim=-1, keepdim=True)
 
         # --- Invert image to noise space ---
-        with torch.no_grad():
-            x_t = self.invert_image(x0, verbose=verbose)
+        if x0islatent is False:
+            with torch.no_grad():
+                x_t = self.invert_image(x0, verbose=verbose)
+        else:
+            x_t = x0.clone().to(device)
 
         # --- Start reverse diffusion with guidance ---
         for t in reversed(range(self.T)):
@@ -502,12 +513,19 @@ class DDIMSampler:
                 img_dir = img_emb_tgt - img_emb_src
                 img_dir = img_dir / img_dir.norm(dim=-1, keepdim=True)
 
-                dir_loss = 1 - (img_dir * text_dir).sum(dim=-1).mean()
+                # dir_loss = 1 - (img_dir * text_dir).sum(dim=-1).mean()
+                dir_loss = (
+                    1.0
+                    - torch.nn.functional.cosine_similarity(
+                        img_dir, text_dir, dim=-1
+                    ).mean()
+                )
 
                 lambda_1 = 0.3  # weight for identity loss (Eq. 11)
                 # Should have a L_face as well, but omitted for simplicity
-                id_loss = lambda_1 * (x0 - x_guided).norm1(dim=-1).mean()
-                
+                # id_loss = lambda_1 * (x0 - x_guided).norm1(dim=-1).mean()
+                id_loss = lambda_1 * torch.nn.functional.l1_loss(x_guided, x0)
+
                 total_loss = dir_loss + id_loss
 
                 total_loss.backward()
@@ -519,7 +537,9 @@ class DDIMSampler:
                     x_guided = x_guided.clamp(-1.5, 1.5).detach().requires_grad_(True)
 
                 if verbose:
-                    print(f"t={t}, step={gs+1}/{guidance_steps}, dir_loss={dir_loss.item():.4f}")
+                    print(
+                        f"t={t}, step={gs+1}/{guidance_steps}, dir_loss={dir_loss.item():.4f}"
+                    )
 
             x_t = x_guided.detach()
             del x_prev, img_for_clip, img_emb_tgt, img_emb_src, dir_loss
@@ -531,113 +551,397 @@ class DDIMSampler:
         return x_t.detach()
 
 
-    def edit_with_clip_old(
-        self,
-        x0,
-        clip_model,
-        clip_preprocess,
-        text_prompt,
-        guidance_scale=100.0,
-        guidance_lr=0.01,
-        guidance_steps=1,
-        edit_steps_per_t=1,
-        verbose=False,
-    ):
-        """
-        x0: (B,3,H,W) in [0, 1]  -- input images to edit (seen->seen case)
-        clip_model: pretrained CLIP model (from clip.load)
-        clip_preprocess: not strictly needed if using tensor pipeline; kept for API compatibility
-        text_prompt: string or list of strings (one per batch entry)
-        guidance_scale: multiplier to scale CLIP gradient (larger = stronger editing)
-        guidance_lr: step size for gradient descent on x_t (small, e.g. 0.01)
-        guidance_steps: number of gradient updates per DDIM step (usually 1)
-        edit_steps_per_t: alias for guidance_steps
-        """
-        device = x0.device
-        batch_size = x0.shape[0]
+# ---------- Step 1: precompute latents ----------
+@torch.no_grad()
+def precompute_latents(
+    pretrained_model,
+    sampler,
+    dataloader,
+    device,
+    return_step,
+    save_dir="latents_out",
+    checkpoint_interval=100,  # save every N batches
+    final_filename="latents_final.pt",
+):
+    """
+    For each image in dataloader, compute deterministic DDIM forward to step `return_step`
+    and save latents x_r (the noisy representation at that return_step).
+    Returns list of tuples: (latent_tensor, source_image_tensor)
+    - pretrained_model: used by sampler for inversion (should be the same model used during training)
+    - sampler.invert_image(x0, return_step=r) should run deterministic forward to produce x_r
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    latent_list = []
 
-        # Prepare text embedding
-        if isinstance(text_prompt, str):
-            text_prompts = [text_prompt] * batch_size
+    # ------------------------------------------------------------
+    # Step A — Detect most recent checkpoint
+    # ------------------------------------------------------------
+    ckpt_pattern = re.compile(r"latents_checkpoint_batch(\d+)\.pt")
+    checkpoints = []
+
+    for fname in os.listdir(save_dir):
+        match = ckpt_pattern.match(fname)
+        if match:
+            batch_num = int(match.group(1))
+            checkpoints.append((batch_num, fname))
+
+    # Find latest checkpoint if any
+    if len(checkpoints) > 0:
+        checkpoints.sort(key=lambda x: x[0])  # sort by batch_num
+        last_batch, last_ckpt_name = checkpoints[-1]
+        last_ckpt_path = os.path.join(save_dir, last_ckpt_name)
+
+        print(f"[Resume] Found checkpoint: {last_ckpt_name} (completed batch {last_batch})")
+        latent_list = torch.load(last_ckpt_path)
+        start_batch = last_batch  # 1-indexed
+    else:
+        print("[Resume] No checkpoint found. Starting fresh.")
+        latent_list = []
+        start_batch = 0
+
+    pretrained_model.eval()
+    # ------------------------------------------------------------
+    # Step B — Resume dataloader iteration
+    # ------------------------------------------------------------
+    # We skip ahead by simply ignoring the first `start_batch` batches.
+    print(f"[Resume] Skipping first {start_batch} batches.")
+    for batch_idx, batch in enumerate(dataloader):
+        if start_batch >= 2500:
+            break  # Limit for memory/storage
+        if batch_idx < start_batch:
+            continue
+        print(f"Processing batch {batch_idx+1}/{len(dataloader)}")
+        if isinstance(batch, (list, tuple)):
+            x0 = batch[0].to(device)  # (B,3,H,W) in [-1,1]
         else:
-            text_prompts = list(text_prompt)
-        text_tokens = clip.tokenize(text_prompts).to(device)
-        with torch.no_grad():
-            text_emb = clip_model.encode_text(text_tokens)  # (B, D)
-            text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
+            x0 = batch.to(device)
+        # invert -> latent at step r
+        # Implement or call a sampler.invert_image that supports a return_step argument.
+        x_r = sampler.invert_image(x0, return_step=return_step)  # (B,3,H,W)
+        # store per-sample
+        for i in range(x_r.shape[0]):
+            latent_list.append((x_r[i].cpu(), x0[i].cpu()))
 
-        # 1) invert image to x_T
-        with torch.no_grad():
-            x_t = self.invert_image(x0, verbose=verbose)  # x_T
+        # ---------- checkpoint save ----------
+        if checkpoint_interval is not None:
+            if (batch_idx + 1) % checkpoint_interval == 0:
+                ckpt_path = os.path.join(
+                    save_dir, f"latents_checkpoint_batch{batch_idx+1}.pt"
+                )
+                torch.save(latent_list, ckpt_path)
+                print(f"[Checkpoint] Saved {len(latent_list)} samples → {ckpt_path}")
+                # ------------------------------------------------------------
+                # <<< NEW >>> Keep only last 2 checkpoints
+                # ------------------------------------------------------------
+                # Re-scan checkpoints
+                checkpoints = []
+                for fname in os.listdir(save_dir):
+                    m = ckpt_pattern.match(fname)
+                    if m:
+                        batch_num = int(m.group(1))
+                        checkpoints.append((batch_num, fname))
 
-        # 2) run reverse DDIM steps t = T-1 ... 0
-        for t in reversed(range(self.T)):
-            # one deterministic step
-            # x_prev = self.ddim_step(x_t, t)
-            with torch.no_grad():
-                x_prev = self.ddim_step(x_t, t)
+                # Sort by batch number (oldest → newest)
+                checkpoints.sort(key=lambda x: x[0])
 
-            # CLIP guidance: n small gradient steps that nudge x_prev to increase similarity(text,image)
-            # We'll update x_prev in-place using gradient ascent (maximize cosine similarity).
-            # Use requires_grad on the image tensor.
-            x_guided = x_prev.clone().detach().requires_grad_(True)
+                # If more than 2, delete oldest ones
+                while len(checkpoints) > 2:
+                    old_batch, old_file = checkpoints.pop(0)
+                    old_path = os.path.join(save_dir, old_file)
+                    try:
+                        os.remove(old_path)
+                        print(f"[Checkpoint Cleanup] Removed old checkpoint: {old_file}")
+                    except FileNotFoundError:
+                        pass
+                # ------------------------------------------------------------
 
-            for gs in range(guidance_steps):
-                # Prepare image for CLIP: convert [0,1] -> normalized clip input
-                img_for_clip = prepare_image_for_clip(x_guided)  # (B,3,224,224)
-                # encode image
-                image_emb = clip_model.encode_image(img_for_clip)
-                image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
+    # ---------- final save ----------
+    final_path = os.path.join(save_dir, final_filename)
+    torch.save(latent_list, final_path)
+    print(f"[Final Save] Saved {len(latent_list)} total samples → {final_path}")
+    return latent_list
 
-                # cosine similarity (B,)
-                cos_sim = (image_emb * text_emb).sum(dim=-1)
 
-                # we want to maximize cos_sim => minimize negative similarity
-                clip_loss = -cos_sim.mean()
+# ---------- Directional CLIP loss ----------
+def directional_clip_loss(clip_model, x, x_ref, text_ref_emb, text_tgt_emb):
+    """
+    x: (B,3,H,W) in [-1,1]
+    x_ref: (B,3,H,W) reference/source images
+    text_ref_emb, text_tgt_emb: (B, D) text embeddings precomputed for batch (normalized)
+    Returns: scalar loss (torch.tensor)
+    """
+    device = x.device
+    # compute image embeddings
+    x_clip = prepare_image_for_clip(x)
+    x_ref_clip = prepare_image_for_clip(x_ref)
+    img_emb = clip_model.encode_image(x_clip)  # (B, D)
+    ref_emb = clip_model.encode_image(x_ref_clip)  # (B, D)
+
+    # normalize
+    img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+    ref_emb = ref_emb / ref_emb.norm(dim=-1, keepdim=True)
+    text_ref_emb = text_ref_emb.to(device)
+    text_tgt_emb = text_tgt_emb.to(device)
+
+    text_dir = text_tgt_emb - text_ref_emb
+    text_dir = text_dir / text_dir.norm(dim=-1, keepdim=True)
+    img_dir = img_emb - ref_emb
+    img_dir = img_dir / img_dir.norm(dim=-1, keepdim=True)
+
+    loss = 1.0 - torch.nn.functional.cosine_similarity(img_dir, text_dir, dim=-1).mean()
+    # compute directions
+    # d_img = img_emb - ref_emb
+    # d_text = text_tgt_emb - text_ref_emb
+    #
+    # # normalize directions
+    # d_img = d_img / (d_img.norm(dim=-1, keepdim=True) + 1e-7)
+    # d_text = d_text / (d_text.norm(dim=-1, keepdim=True) + 1e-7)
+    #
+    # cos_sim = (d_img * d_text).sum(dim=-1)   # (B,)
+    # loss = (1.0 - cos_sim).mean()
+    return loss
+
+
+# ---------- Identity loss (L2) ----------
+def identity_loss(x_generated, x_ref):
+    # simple pixel L2 (you can replace with face-id loss for faces)
+    lambda_1 = 0.3  # weight for identity loss (Eq. 11)
+    # Should have a L_face as well, but omitted for simplicity
+    id_loss = torch.nn.functional.l1_loss(x_generated, x_ref)
+
+    return id_loss
+    # return F.mse_loss(x_generated, x_ref)
+
+
+# ---------- Step 2: GPU-efficient fine-tuning ----------
+def gpu_efficient_finetune(
+    pretrained_model,
+    sampler,
+    latents,
+    clip_model,
+    optimizer,
+    text_ref,
+    text_tgt,
+    device,
+    return_step,
+    gen_steps,
+    finetune_iters,
+    lambda_dir=1.0,
+    lambda_id=0.3,
+    verbose=True,
+    ckpt_dir="finetune_ckpts",  # NEW
+    ckpt_every=10,  # save every N outer iters
+):
+    """
+    pretrained_model: the model copy to fine-tune (should be a clone if you want to keep original)
+    sampler: DDIMSampler bound to pretrained_model (it uses model(x,t) internally)
+    latents: list of (x_r_cpu, x0_cpu) tuples returned by precompute_latents
+    clip_model: CLIP model already moved to device
+    optimizer: optimizer over pretrained_model parameters
+    text_ref, text_tgt: strings or list of strings (one per sample). We'll tokenize & encode to embeddings.
+    return_step: step index r (start time for reverse DDIM)
+    gen_steps: number of reverse steps to run (like # of timesteps from r -> 0)
+    finetune_iters: number of iterations over dataset (outer loop)
+    lambda_dir, lambda_id: weights for directional CLIP loss and identity loss
+    """
+    import os
+
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Precompute text embeddings (repeat if necessary)
+    # If text_ref/text_tgt are single strings, broadcast per batch later.
+    clip_model.eval()
+    # If the text inputs are single strings, we keep them and expand per batch later.
+    text_ref_token = (
+        clip.tokenize([text_ref]).to(device)
+        if isinstance(text_ref, str)
+        else clip.tokenize(text_ref).to(device)
+    )
+    text_tgt_token = (
+        clip.tokenize([text_tgt]).to(device)
+        if isinstance(text_tgt, str)
+        else clip.tokenize(text_tgt).to(device)
+    )
+    with torch.no_grad():
+        text_ref_emb_base = clip_model.encode_text(text_ref_token)  # (1,D) or (B,D)
+        text_tgt_emb_base = clip_model.encode_text(text_tgt_token)
+        text_ref_emb_base = text_ref_emb_base / text_ref_emb_base.norm(
+            dim=-1, keepdim=True
+        )
+        text_tgt_emb_base = text_tgt_emb_base / text_tgt_emb_base.norm(
+            dim=-1, keepdim=True
+        )
+
+    pretrained_model.train()
+    gen = torch.Generator(device=device).manual_seed(42)
+
+    # main outer loop
+    for it in range(finetune_iters):
+        if verbose:
+            print(f"Fine-tune iter {it+1}/{finetune_iters}")
+        # iterate over latents (can randomize order)
+        for idx, (x_r_cpu, x0_cpu) in enumerate(latents):
+            # load single sample to device
+            x_t = x_r_cpu.to(device).unsqueeze(0)  # shape (1,3,H,W)
+            x_ref = x0_cpu.to(device).unsqueeze(0)
+
+            # If text tokens are singletons, reuse base embeddings
+            text_ref_emb = (
+                text_ref_emb_base
+                if text_ref_emb_base.shape[0] > 1
+                else text_ref_emb_base.repeat(1, 1).squeeze(0).unsqueeze(0)
+            )
+
+            # If multiple target embeddings exist, pick one at random (DiffusionCLIP style)
+            if text_tgt_emb_base.shape[0] > 1:
+                rand_idx = torch.randint(
+                    0, text_tgt_emb_base.shape[0], (1,), device=device, generator=gen
+                )
+                text_tgt_emb = text_tgt_emb_base[rand_idx].unsqueeze(0)
+            else:
+                text_tgt_emb = text_tgt_emb_base.unsqueeze(0)
+            # text_tgt_emb = (
+            #     text_tgt_emb_base
+            #     if text_tgt_emb_base.shape[0] > 1
+            #     else text_tgt_emb_base.repeat(1, 1).squeeze(0).unsqueeze(0)
+            # )
+
+            # For GPU-efficient: iterate timesteps and do loss+step each t
+            # We assume sampler uses the same alphas and that t indexes are valid
+            # run reverse DDIM from t = return_step down to 0 (or gen_steps steps)
+            # We'll map steps: t_idx values should be chosen consistent with how you precomputed x_r
+            for step_i in range(gen_steps):  # step_i = 0..gen_steps-1
+                # compute current timestep index (e.g., t = return_step - step_i * stride)
+                # For simplicity assume sequential integer timesteps
+                t = return_step - step_i
+                if t < 0:
+                    break
+
+                # Using the model's prediction (note: sampler.ddim_step should call model internally)
+                # We compute x_prev (x_{t-1}) using sampler but ensure graph kept for gradients
+                # sampler.ddim_step calls model(x_t, t) and returns x_prev
+                x_prev = sampler.ddim_step(
+                    x_t, t
+                )  # this creates graph back to model parameters
+
+                # Predict current clean image x0_pred using standard reconstruction formula
+                # (we can reuse code inside sampler or recompute eps_pred, alpha bars here)
+                # For readability recompute eps_pred & x0_pred:
+                t_tensor = torch.full((1,), t, dtype=torch.long, device=device)
+                eps_pred = pretrained_model(x_t, t_tensor)  # (1,3,H,W)
+                alpha_bar_t = sampler.alphas_cumprod[t].to(device).view(1, 1, 1, 1)
+                sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
+                x0_pred = (
+                    x_t - sqrt_one_minus_alpha_bar_t * eps_pred
+                ) / sqrt_alpha_bar_t
+
+                # compute losses
+                dir_loss = directional_clip_loss(
+                    clip_model, x0_pred, x_ref, text_ref_emb, text_tgt_emb
+                )
+                id_loss = identity_loss(x0_pred, x_ref)
+
+                loss = lambda_dir * dir_loss + lambda_id * id_loss
+
+                # gradient step: backward & optimizer.step immediately (GPU-efficient)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                # detach x_prev and use as next x_t (no graph kept)
+                x_t = x_prev.detach()
+
+            # optionally print progress
+            if verbose and (idx % 10 == 0):
                 print(
-                    f"t={t}, guidance step {gs+1}/{guidance_steps}, clip_loss={clip_loss.item():.4f}"
+                    f" sample {idx}/{len(latents)} loss: {loss.item():.4f} dir: {dir_loss.item():.4f} id: {id_loss.item():.4f}"
                 )
 
-                # backward to get gradient w.r.t. x_guided
-                clip_loss.backward()
+            # ───────────────────────────────────────────────────────────────
+            # CHECKPOINT SAVING
+            # ───────────────────────────────────────────────────────────────
+            if ckpt_every is not None and (idx + 1) % ckpt_every == 0:
+                ckpt_path = f"{ckpt_dir}/ft_iter_{it+1}_sample_{idx+1}.pt"
+                torch.save(
+                    {
+                        "iter": it + 1,
+                        "sample_idx": idx + 1,
+                        "model": pretrained_model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                    },
+                    ckpt_path,
+                )
+                if verbose:
+                    print(f"Saved checkpoint ➜ {ckpt_path}")
+                # ────────────────────────────────────────────────
+                # PRUNE OLD CHECKPOINTS (keep only newest N)
+                # ────────────────────────────────────────────────
+                keep_last = 2  # keep only last N checkpoints
+                ckpts = sorted(
+                    glob.glob(f"{ckpt_dir}/ft_iter_*_sample_*.pt"),
+                    key=os.path.getmtime,
+                    reverse=True,  # newest first
+                )
 
-                # gradient step (gradient ascent on cos_sim)
-                # note: x_guided.grad shape matches x_guided
-                grad = x_guided.grad
-                # simple update: x_guided = x_guided - (-lr * grad) because we minimize clip_loss
-                with torch.no_grad():
-                    x_guided = x_guided - guidance_lr * (grad * guidance_scale)
-                    # clamp to reasonable range for stability
-                    x_guided = x_guided.clamp(-1.5, 1.5).detach().requires_grad_(True)
+                if len(ckpts) > keep_last:
+                    old_ckpts = ckpts[keep_last:]  # everything except newest N
+                    for old in old_ckpts:
+                        try:
+                            os.remove(old)
+                            if verbose:
+                                print(f"Removed old checkpoint → {old}")
+                        except OSError:
+                            pass
 
-            # after guidance steps, set x_t for next iteration
-            x_t = x_guided.detach()
+    # save final
+    final_path = f"{ckpt_dir}/final_finetuned.pt"
+    torch.save(
+        {
+            "iter": finetune_iters,
+            "model": pretrained_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        final_path,
+    )
 
-            # optionally clear memory
-            del x_prev, img_for_clip, image_emb, cos_sim, clip_loss, grad
-            torch.cuda.empty_cache()
-
-            if verbose and (t % 10 == 0):
-                print(f"edited step t={t}")
-
-        # after loop, x_t is x_0 edited
-        edited = x_t.detach()
-        return edited
+    if verbose:
+        print(f"\nFinal fine-tuned model saved to {final_path}")
+    return pretrained_model
 
 
-def edit_image_with_clip(
-    img, model_path="./models/celeba/ckpt_epoch_10.pt", prompt_style="sketch"
+def finetune_on_celeba(
+    pretrained_model_path="./models/celeba/ckpt_epoch_10.pt",
+    batch_size=30,
+    return_step=350,
+    gen_steps=50,
+    finetune_iters=5,
+    lambda_dir=1.0,
+    lambda_id=0.3,
+    lr=2e-3,
+    ckpt_dir="finetune_ckpts",
+    ckpt_every=1,
 ):
+    """
+    Full training pipeline:
+    1. Precompute latents x_r for every CelebA image.
+    2. Run your gpu_efficient_finetune() on those latents.
+    """
+    image_size = 128
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
     # Load a pretrained model
-    ckpt_path = model_path
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    ckpt = torch.load(pretrained_model_path, map_location=device)
+    pretrained_model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(
+        device
+    )
+    pretrained_model.load_state_dict(ckpt["model_state_dict"])
+    timesteps = ckpt["timesteps"]
     betas = ckpt["betas"].to(device)
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
-    sampler = DDIMSampler(model.to(device), alphas_cumprod.to(device))
+
+    sampler = DDIMSampler(pretrained_model.to(device), alphas_cumprod.to(device))
 
     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device, jit=False)
 
@@ -649,19 +953,200 @@ def edit_image_with_clip(
         ]
     )
 
-    x0 = train_ds[0][0].unsqueeze(0).to(device)
+    train_ds = torchvision.datasets.CelebA(
+        root="./data",
+        split="train",
+        target_type="attr",
+        download=False,
+        transform=transform,
+    )
+    dataloader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True
+    )
+    optimizer = torch.optim.Adam(pretrained_model.parameters(), lr=lr)
 
-    edited = sampler.edit_with_clip(
-        x0.to(device),
+    # ------------------------------------------------------------------
+    # 1) Compute latents (DDIM forward)
+    # ------------------------------------------------------------------
+    print("Precomputing latents...")
+    if os.path.exists("latents_out/latents_final.pt"):
+        print("Found existing latents file. Loading...")
+        latents = torch.load("latents_out/latents_final.pt")
+    else:
+        latents = precompute_latents(
+            pretrained_model=pretrained_model,
+            sampler=sampler,
+            dataloader=dataloader,
+            device=device,
+            return_step=return_step,
+        )
+    print(f"Latents computed: {len(latents)} samples")
+
+    # ------------------------------------------------------------------
+    # 2) Run YOUR gpu-efficient fine-tuning
+    # ------------------------------------------------------------------
+    text_ref = "face"
+    text_tgt = [
+        "angry",
+        "beard",
+        "smile",
+        "anime",
+        "gogh style",
+    ]
+    gpu_efficient_finetune(
+        pretrained_model=pretrained_model,
+        sampler=sampler,
+        latents=latents,
+        clip_model=clip_model,
+        optimizer=optimizer,
+        text_ref=text_ref,
+        text_tgt=text_tgt,
+        device=device,
+        return_step=return_step,
+        gen_steps=gen_steps,
+        finetune_iters=finetune_iters,
+        lambda_dir=lambda_dir,
+        lambda_id=lambda_id,
+        verbose=True,
+        ckpt_dir=ckpt_dir,
+        ckpt_every=ckpt_every,
+    )
+
+    return pretrained_model
+
+
+def edit_image(
+    x0,
+    S_for=200,
+    S_gen=199,
+    unet_path="./models/celeba/ckpt_epoch_10.pt",
+    finetuned_path="./finetune_ckpts/final_finetuned.pt",
+    prompt_style="beard",
+    image_size=128,
+    img_desc="face",
+    workaround=False,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x0 = x0.clone().to(device)
+    # Load a pretrained model
+    ckpt = torch.load(unet_path, map_location=device)
+    pretrained_model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(
+        device
+    )
+    pretrained_model.load_state_dict(ckpt["model_state_dict"])
+    timesteps = ckpt["timesteps"]
+    betas = ckpt["betas"].to(device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+    sampler = DDIMSampler(pretrained_model.to(device), alphas_cumprod.to(device))
+
+    clip_model, clip_preprocess = clip.load("ViT-B/32", device=device, jit=False)
+
+    # Load fine-tuned model
+    if workaround:
+        finetuned_model = pretrained_model
+    else:
+        finetuned_ckpt = torch.load(finetuned_path, map_location=device)
+        finetuned_model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(
+            device
+        )
+        finetuned_model.load_state_dict(finetuned_ckpt["model"])
+
+    # =====================================================================
+    # 1) INVERSION — produce x_r using pretrained model
+    # =====================================================================
+    with torch.no_grad():
+        x_r = sampler.invert_image(x0, return_step=S_for)
+
+    # -----------------------------------------------------
+    # 2) GENERATION: x_r → edited image using finetuned model
+    # -----------------------------------------------------
+    # Original image is in [0, 1] -> return a edited image in [0, 1]
+    xt = x_r.clone()
+    aux_sampler = DDIMSampler(finetuned_model.to(device), alphas_cumprod.to(device))
+    edited = aux_sampler.edit_with_clip(
+        xt,
         clip_model,
         clip_preprocess,
-        prompt_sytle,
+        img_desc,
+        prompt_style,
         guidance_scale=100.0,
-        guidance_lr=0.01,
+        guidance_lr=2e-3,
         guidance_steps=1,
         verbose=True,
+        x0islatent=True,
     )
+
+    # # timesteps from S_for → 0
+    # tau = torch.linspace(S_for, 0, steps=S_gen).long().to(device)
+    #
+    # for i in range(S_gen - 1):
+    #     t = tau[i].item()
+    #     t_prev = tau[i + 1].item()
+    #
+    #     t_tensor = torch.tensor([t], device=device)
+    #
+    #     # ε̂_finetuned(x_t, t, ref, tgt)
+    #     with torch.no_grad():
+    #         eps = finetuned_model(xt, t_tensor)
+    #
+    #     # DDIM update (deterministic)
+    #     ab_t = alphas_cumprod[t]
+    #     ab_prev = alphas_cumprod[t_prev]
+    #
+    #     sqrt_ab_t = torch.sqrt(ab_t).view(1,1,1,1)
+    #     sqrt_1m_t = torch.sqrt(1 - ab_t).view(1,1,1,1)
+    #
+    #     sqrt_ab_prev = torch.sqrt(ab_prev).view(1,1,1,1)
+    #     sqrt_1m_prev = torch.sqrt(1 - ab_prev).view(1,1,1,1)
+    #
+    #     x0_pred = (xt - sqrt_1m_t * eps) / sqrt_ab_t
+    #
+    #     xt = sqrt_ab_prev * x0_pred + sqrt_1m_prev * eps
+    #
+    # # convert back to image space
+    edited = (xt.clamp(-1, 1) + 1) / 2
+
     return edited
+
+# def edit_image_with_clip(
+#     img, model_path="./models/celeba/ckpt_epoch_10.pt", prompt_style="sketch"
+# ):
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     # Load a pretrained model
+#     ckpt_path = model_path
+#     ckpt = torch.load(ckpt_path, map_location=device)
+#     model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(device)
+#     model.load_state_dict(ckpt["model_state_dict"])
+#     betas = ckpt["betas"].to(device)
+#     alphas = 1.0 - betas
+#     alphas_cumprod = torch.cumprod(alphas, dim=0)
+#     sampler = DDIMSampler(model.to(device), alphas_cumprod.to(device))
+#
+#     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device, jit=False)
+#
+#     transform = transforms.Compose(
+#         [
+#             transforms.Resize(image_size),
+#             transforms.CenterCrop(image_size),
+#             transforms.ToTensor(),
+#         ]
+#     )
+#
+#     x0 = train_ds[0][0].unsqueeze(0).to(device)
+#
+#     edited = sampler.edit_with_clip(
+#         x0.to(device),
+#         clip_model,
+#         clip_preprocess,
+#         prompt_sytle,
+#         guidance_scale=100.0,
+#         guidance_lr=0.01,
+#         guidance_steps=1,
+#         verbose=True,
+#     )
+#     return edited
 
 
 # %%
@@ -669,11 +1154,66 @@ if __name__ == "__main__":
     image_size = 128
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
+
+    pretrained_model_path = "./models/celeba/ckpt_epoch_10.pt"
+    finetuned_model_path = "./finetune_ckpts/final_finetuned.pt"
+    transform = transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+        ]
+    )
+
+    train_ds = torchvision.datasets.CelebA(
+        root="./data",
+        split="train",
+        target_type="attr",
+        download=False,
+        transform=transform,
+    )
+
+    x0 = train_ds[0][0].unsqueeze(0).to(device)
+    img, label = train_ds[0]
+    px.imshow(img.permute(1, 2, 0).numpy())
+    img = img.unsqueeze(0)
+
+
+    edited = edit_image(
+        img,
+        S_for=199,
+        S_gen=3000,
+        unet_path=pretrained_model_path,
+        finetuned_path=finetuned_model_path,
+        prompt_style="beard",
+        image_size=image_size,
+        img_desc="face",
+        workaround=True
+    )
+    px.imshow(edited.squeeze(0).cpu().permute(1, 2, 0).numpy() * 255)
+    edited
+
+    # Fine tune
+    # finetuned_model = finetune_on_celeba(
+    #     pretrained_model_path="./models/celeba/ckpt_epoch_10.pt",
+    #     batch_size=30,
+    #     return_step=199,
+    #     gen_steps=50,
+    #     finetune_iters=5,
+    #     lambda_dir=1.0,
+    #     lambda_id=0.3,
+    #     lr=2e-3,
+    #     ckpt_dir="finetune_ckpts",
+    #     ckpt_every=10,
+    # )
+    # print("Fine-tuning completed.")
     # Load a pretrained model
     ckpt_path = "./models/celeba/ckpt_epoch_10.pt"
     ckpt = torch.load(ckpt_path, map_location=device)
-    model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    pretrained_model = TinyUNet(img_channels=3, base_channels=64, time_emb_dim=256).to(
+        device
+    )
+    pretrained_model.load_state_dict(ckpt["model_state_dict"])
     timesteps = ckpt["timesteps"]
     betas = ckpt["betas"].to(device)
     alphas = 1.0 - betas
@@ -688,7 +1228,7 @@ if __name__ == "__main__":
     #     device=device,
     # )
 
-    sampler = DDIMSampler(model.to(device), alphas_cumprod.to(device))
+    sampler = DDIMSampler(pretrained_model.to(device), alphas_cumprod.to(device))
 
     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device, jit=False)
 
@@ -710,18 +1250,11 @@ if __name__ == "__main__":
         transform=transform,
     )
 
-    # transform = transforms.Compose([
-    #         transforms.Resize(img_size),
-    #         transforms.ToTensor(),              # [0,1]
-    #         transforms.Lambda(lambda t: (t * 2.0) - 1.0)  # to [-1,1]
-    #     ])
-    # train_ds = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
     x0 = train_ds[0][0].unsqueeze(0).to(device)
     img, label = train_ds[0]
-    
 
     img_desc = "face"
-    prompt_sytle = "beard"
+    prompt_sytle = "sketch"
     edited = sampler.edit_with_clip(
         x0.to(device),
         clip_model,
@@ -733,7 +1266,8 @@ if __name__ == "__main__":
         guidance_steps=10,
         verbose=True,
     )
-
+#
+#
 # %%
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
@@ -818,8 +1352,7 @@ original_image_display = x0.squeeze(0).cpu()
 px.imshow(original_image_display.permute(1, 2, 0).numpy())
 
 
-
-# %% 
+# %%
 
 # Before loop:
 src_tokens = clip.tokenize(["photo"] * batch_size).to(device)
@@ -839,7 +1372,7 @@ delta_t = delta_t / delta_t.norm(dim=-1, keepdim=True)
 clip_loss = 1 - (delta_i * delta_t).sum(dim=-1).mean()
 
 
-
 # Optionally
-clip_loss = 0.5 * (1 - (delta_i * delta_t).sum(dim=-1).mean()) \
-          + 0.5 * (1 - (image_emb * text_emb).sum(dim=-1).mean())
+clip_loss = 0.5 * (1 - (delta_i * delta_t).sum(dim=-1).mean()) + 0.5 * (
+    1 - (image_emb * text_emb).sum(dim=-1).mean()
+)
