@@ -1065,47 +1065,47 @@ def edit_image(
     # Original image is in [0, 1] -> return a edited image in [0, 1]
     xt = x_r.clone()
     aux_sampler = DDIMSampler(finetuned_model.to(device), alphas_cumprod.to(device))
-    edited = aux_sampler.edit_with_clip(
-        xt,
-        clip_model,
-        clip_preprocess,
-        img_desc,
-        prompt_style,
-        guidance_scale=100.0,
-        guidance_lr=2e-3,
-        guidance_steps=1,
-        verbose=True,
-        x0islatent=True,
-    )
+    # edited = aux_sampler.edit_with_clip(
+    #     xt,
+    #     clip_model,
+    #     clip_preprocess,
+    #     img_desc,
+    #     prompt_style,
+    #     guidance_scale=100.0,
+    #     guidance_lr=2e-3,
+    #     guidance_steps=1,
+    #     verbose=True,
+    #     x0islatent=True,
+    # )
 
-    # # timesteps from S_for → 0
-    # tau = torch.linspace(S_for, 0, steps=S_gen).long().to(device)
-    #
-    # for i in range(S_gen - 1):
-    #     t = tau[i].item()
-    #     t_prev = tau[i + 1].item()
-    #
-    #     t_tensor = torch.tensor([t], device=device)
-    #
-    #     # ε̂_finetuned(x_t, t, ref, tgt)
-    #     with torch.no_grad():
-    #         eps = finetuned_model(xt, t_tensor)
-    #
-    #     # DDIM update (deterministic)
-    #     ab_t = alphas_cumprod[t]
-    #     ab_prev = alphas_cumprod[t_prev]
-    #
-    #     sqrt_ab_t = torch.sqrt(ab_t).view(1,1,1,1)
-    #     sqrt_1m_t = torch.sqrt(1 - ab_t).view(1,1,1,1)
-    #
-    #     sqrt_ab_prev = torch.sqrt(ab_prev).view(1,1,1,1)
-    #     sqrt_1m_prev = torch.sqrt(1 - ab_prev).view(1,1,1,1)
-    #
-    #     x0_pred = (xt - sqrt_1m_t * eps) / sqrt_ab_t
-    #
-    #     xt = sqrt_ab_prev * x0_pred + sqrt_1m_prev * eps
-    #
-    # # convert back to image space
+    # timesteps from S_for → 0
+    tau = torch.linspace(S_for, 0, steps=S_gen).long().to(device)
+
+    for i in range(S_gen - 1):
+        t = tau[i].item()
+        t_prev = tau[i + 1].item()
+
+        t_tensor = torch.tensor([t], device=device)
+
+        # ε̂_finetuned(x_t, t, ref, tgt)
+        with torch.no_grad():
+            eps = finetuned_model(xt, t_tensor)
+
+        # DDIM update (deterministic)
+        ab_t = alphas_cumprod[t]
+        ab_prev = alphas_cumprod[t_prev]
+
+        sqrt_ab_t = torch.sqrt(ab_t).view(1,1,1,1)
+        sqrt_1m_t = torch.sqrt(1 - ab_t).view(1,1,1,1)
+
+        sqrt_ab_prev = torch.sqrt(ab_prev).view(1,1,1,1)
+        sqrt_1m_prev = torch.sqrt(1 - ab_prev).view(1,1,1,1)
+
+        x0_pred = (xt - sqrt_1m_t * eps) / sqrt_ab_t
+
+        xt = sqrt_ab_prev * x0_pred + sqrt_1m_prev * eps
+
+    # convert back to image space
     edited = (xt.clamp(-1, 1) + 1) / 2
 
     return edited
@@ -1182,7 +1182,7 @@ if __name__ == "__main__":
     edited = edit_image(
         img,
         S_for=199,
-        S_gen=3000,
+        S_gen=30000,
         unet_path=pretrained_model_path,
         finetuned_path=finetuned_model_path,
         prompt_style="beard",
