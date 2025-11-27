@@ -1150,7 +1150,8 @@ def edit_image(
 
 
 # %%
-if __name__ == "__main__":
+# if __name__ == "__main__":
+if True:
     image_size = 128
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
@@ -1174,7 +1175,7 @@ if __name__ == "__main__":
     )
 
     x0 = train_ds[0][0].unsqueeze(0).to(device)
-    img, label = train_ds[0]
+    img, label = train_ds[100]
     px.imshow(img.permute(1, 2, 0).numpy())
     img = img.unsqueeze(0)
 
@@ -1182,7 +1183,7 @@ if __name__ == "__main__":
     edited = edit_image(
         img,
         S_for=199,
-        S_gen=30000,
+        S_gen=50,
         unet_path=pretrained_model_path,
         finetuned_path=finetuned_model_path,
         prompt_style="beard",
@@ -1191,7 +1192,7 @@ if __name__ == "__main__":
         workaround=True
     )
     px.imshow(edited.squeeze(0).cpu().permute(1, 2, 0).numpy() * 255)
-    edited
+    edited * 255
 
     # Fine tune
     # finetuned_model = finetune_on_celeba(
@@ -1250,7 +1251,7 @@ if __name__ == "__main__":
         transform=transform,
     )
 
-    x0 = train_ds[0][0].unsqueeze(0).to(device)
+    x0 = train_ds[100][0].unsqueeze(0).to(device)
     img, label = train_ds[0]
 
     img_desc = "face"
@@ -1266,49 +1267,115 @@ if __name__ == "__main__":
         guidance_steps=10,
         verbose=True,
     )
-#
-#
+
+#%%
+
+def generate_figs(idx):
+    image_size = 128
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pretrained_model_path = "./models/celeba/ckpt_epoch_10.pt"
+    finetuned_model_path = "./finetune_ckpts/final_finetuned.pt"
+    transform = transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+        ]
+    )
+
+    train_ds = torchvision.datasets.CelebA(
+        root="./data",
+        split="train",
+        target_type="attr",
+        download=False,
+        transform=transform,
+    )
+
+    x0 = train_ds[idx][0].unsqueeze(0).to(device)
+    img, label = train_ds[idx]
+    img = img.unsqueeze(0)
+
+
+    edited = edit_image(
+        img,
+        S_for=199,
+        S_gen=50,
+        unet_path=pretrained_model_path,
+        finetuned_path=finetuned_model_path,
+        prompt_style="beard",
+        image_size=image_size,
+        img_desc="face",
+        workaround=True
+    )
+
+    latent = edit_image(
+        img,
+        S_for=199,
+        S_gen=1,
+        unet_path=pretrained_model_path,
+        finetuned_path=finetuned_model_path,
+        prompt_style="beard",
+        image_size=image_size,
+        img_desc="face",
+        workaround=True
+    )
+
+    return img, edited, latent
+
 # %%
+"""Generate result figures"""
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 
 
-# Images are in [0, 1]
-# x0 = train_ds[5][0].unsqueeze(0).to(device)
-original_image_display = x0.squeeze(0).cpu()
-edited_image_display = edited.squeeze(0).cpu()
-# original_image_display = (x0.squeeze(0).cpu() + 1) / 2
-# edited_image_display = (edited.squeeze(0).cpu() + 1) / 2
-
-
-def _create_fig():
-    fig = make_subplots(1, 2)
+def _create_fig(original_image_display, edited_image_display, latent_image_display):
+    fig = make_subplots(1, 3)
     fig.add_trace(
         go.Image(z=original_image_display.permute(1, 2, 0).numpy() * 255), row=1, col=1
     )
     fig.add_trace(
-        go.Image(z=edited_image_display.permute(1, 2, 0).numpy() * 255), row=1, col=2
+        go.Image(z=latent_image_display.permute(1, 2, 0).numpy() * 255), row=1, col=2
+    )
+    fig.add_trace(
+        go.Image(z=edited_image_display.permute(1, 2, 0).numpy() * 255), row=1, col=3
     )
     return fig
 
+rng = np.random.default_rng(42)
+# indices = rng.integers(0, 150000, size=10)
+indices = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900]
+# Create reults dir
+os.makedirs("results", exist_ok=True)
 
-fig = _create_fig()
-fig.show()
+for idx in indices:
+    original_image, edited_image, latent_image = generate_figs(idx)
+    original_image_display = original_image.squeeze(0).cpu()
+    edited_image_display = edited_image.squeeze(0).cpu()
+    latent_image_display = latent_image.squeeze(0).cpu()
 
-plt.figure(figsize=(10, 5))
-plt.subplot(1, 2, 1)
-plt.imshow(original_image_display.permute(1, 2, 0))
-plt.title("Original Image")
-plt.axis("off")
-plt.subplot(1, 2, 2)
-plt.imshow(edited_image_display.permute(1, 2, 0))
-plt.title(f"Edited Image ({prompt_sytle})")
-plt.axis("off")
-plt.show()
-plt.savefig("clip_guided_editing_result.png")
-
+    fig = _create_fig(original_image_display, edited_image_display, latent_image_display)
+    fig.update_layout(
+        # title_text=f"Image Index: {idx}",
+        showlegend=False,
+        margin=dict(l=0, r=0, t=30, b=0),
+    )
+    fig.write_image(f"results/clip_guided_editing_result_{idx}.png", width=1200, height=400)
+    fig.show()
+print("done")
+# plt.figure(figsize=(10, 5))
+# plt.subplot(1, 2, 1)
+# plt.imshow(original_image_display.permute(1, 2, 0))
+# plt.title("Original Image")
+# plt.axis("off")
+# plt.subplot(1, 2, 2)
+# plt.imshow(edited_image_display.permute(1, 2, 0))
+# plt.title(f"Edited Image ({prompt_sytle})")
+# plt.axis("off")
+# plt.show()
+# plt.savefig("clip_guided_editing_result.png")
+#
 # %%
 import torchvision
 from torchvision.datasets import CelebA
